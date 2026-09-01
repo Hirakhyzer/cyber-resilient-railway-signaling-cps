@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "If you use this research software, please cite the repository and the exact commit used."
+title: "Cyber-Resilient Railway Signaling Cyber-Physical System"
+type: software
+authors:
+  - family-names: Khyzer
+    given-names: Hira
+repository-code: "https://github.com/Hirakhyzer/cyber-resilient-railway-signaling-cps"
+version: 0.1.0
+date-released: 2026-09-02
+license: MIT
