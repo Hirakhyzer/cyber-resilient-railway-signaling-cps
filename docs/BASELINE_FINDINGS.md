@@ -14,13 +14,19 @@ These results come from the deterministic v0.1 synthetic benchmark (`seed=7`, 22
 | Signal falsification | 100% | 0.0% | 100% | 0.980 |
 | Switch falsification | 100% | 0.0% | 100% | 0.980 |
 | Packet loss | n/a | 0.0% | 100% | 1.000 |
-| High latency | n/a | 0.0% | 100% | 1.000 |
+| High latency | n/a | *superseded; re-benchmark after latency-queue fix* | — | — |
 
 ## What the baseline shows
 
 Simple freshness metadata makes ordinary replay easy to detect, but **rewriting sequence/timestamp metadata defeats the v0.1 detector** because the replayed payload can remain physically plausible for short intervals. This is the main scientific limitation.
 
 The small false-positive rate after rewritten replay reflects recovery/transient mismatch between the replayed telemetry and the digital twin. v0.2 should explicitly model recovery synchronization rather than treating that artifact as attack evidence.
+
+## Latency-model correction
+
+The original v0.1 `high_latency` row is no longer treated as a valid benchmark result. The network model sampled a delay value but the simulation processed the returned packet immediately, so the scenario did not actually delay telemetry. The network now queues packets until their simulated delivery time and the simulation reports mean T1 telemetry age. High-latency metrics must therefore be regenerated before publication or comparison with the original table.
+
+This correction is a model-semantics fix, not evidence of improved detection performance.
 
 ## v0.2 questions
 
