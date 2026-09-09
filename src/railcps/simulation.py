@@ -75,6 +75,7 @@ def run_simulation(scenario: str="normal", steps: int=220, dt: float=1.0, seed: 
     freshness=FreshnessChecker(); twin=RailwayDigitalTwin(); unc=TwinUncertainty(); detector=HybridDetector(); trust=TrustManager(); supervisor=ResilienceSupervisor(); recovery=RecoveryTracker()
     for t in rail.trains.values(): twin.initialize(t)
     sequence={}; records=[]; labels=[]; alarms=[]; safety_hist=[]; restricted_steps=0
+    pending_meta: dict[int, tuple[int,str]]={}
     attack_start,attack_end=55,105
     for step in range(steps):
         now=step*dt
@@ -105,15 +106,20 @@ def run_simulation(scenario: str="normal", steps: int=220, dt: float=1.0, seed: 
             sources.append((f"occupancy:{bid}", {"block_id":bid,"occupied":int(not block.clear)}, "occupancy"))
         sources.append(("signal:S2", {"aspect":rail.signals["S2"].aspect}, "signal"))
         sources.append(("switch:SW1", {"position":rail.switches["SW1"].position}, "switch"))
+
         for src,payload,kind in sources:
             sequence[src]=sequence.get(src,0)+1
             packet=TelemetryPacket(src,sequence[src],now,payload)
             active=attack_start <= step < attack_end
             packet=injector.apply(packet,step,active)
-            delivered,_=network.transmit(packet)
             label=int(active and mode!="none" and (target is None or src==target))
-            if delivered is None:
+            if not network.send(packet,now):
                 labels.append(0); alarms.append(0); continue
+            pending_meta[id(packet)]=(label,kind)
+
+        for delivered in network.receive(now):
+            label,kind=pending_meta.pop(id(delivered),(0,"unknown"))
+            src=delivered.source
             fresh=freshness.check(delivered)
             if kind=="train":
                 tid=src.split(":",1)[1]; ts=twin.states[tid]; res=train_residual(delivered.payload,ts,unc)
@@ -122,7 +128,8 @@ def run_simulation(scenario: str="normal", steps: int=220, dt: float=1.0, seed: 
                 if kind=="occupancy":
                     bid=src.split(":",1)[1]; expected={"block_id":bid,"occupied":int(not rail.track.blocks[bid].clear)}
                 elif kind=="signal": expected={"aspect":rail.signals["S2"].aspect}
-                else: expected={"position":rail.switches["SW1"].position}
+                elif kind=="switch": expected={"position":rail.switches["SW1"].position}
+                else: continue
                 result=detector.evaluate_discrete(src,expected,delivered.payload,fresh)
             new_trust=trust.update(src,result.score)
             recovered=recovery.update(src,result.alarm)
@@ -131,8 +138,12 @@ def run_simulation(scenario: str="normal", steps: int=220, dt: float=1.0, seed: 
             if dec.state!="NORMAL": restricted_steps += 1
             labels.append(label); alarms.append(int(result.alarm))
             if kind=="train" and src=="train:T1":
-                records.append({"step":step,"time_s":now,"source":src,"alarm":result.alarm,"score":round(result.score,3),"trust":round(new_trust,3),"state":dec.state,"attack":label})
+                records.append({"step":step,"time_s":now,"source":src,"alarm":result.alarm,"score":round(result.score,3),"trust":round(new_trust,3),"state":dec.state,"attack":label,"telemetry_age_s":round(max(0.0,now-delivered.timestamp),3)})
     cyber=classification_metrics(labels,alarms); ops=service_metrics(rail.trains,steps*dt); safe=safety_metrics(safety_hist)
     restriction_fraction=restricted_steps/max(1,len(labels)); res_score=resilience_score(ops["completion_ratio"],sum(safe.values()),restriction_fraction)
     metrics={**cyber,**ops,**safe,"restriction_fraction":restriction_fraction,"resilience_score":res_score}
+    if records:
+        metrics["mean_t1_telemetry_age_s"]=sum(r["telemetry_age_s"] for r in records)/len(records)
+    else:
+        metrics["mean_t1_telemetry_age_s"]=0.0
     return SimulationResult(scenario,metrics,records)
