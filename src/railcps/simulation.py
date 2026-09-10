@@ -74,11 +74,14 @@ def run_simulation(scenario: str="normal", steps: int=220, dt: float=1.0, seed: 
     injector=AttackInjector(mode,target,magnitude)
     freshness=FreshnessChecker(); twin=RailwayDigitalTwin(); unc=TwinUncertainty(); detector=HybridDetector(); trust=TrustManager(); supervisor=ResilienceSupervisor(); recovery=RecoveryTracker()
     for t in rail.trains.values(): twin.initialize(t)
-    sequence={}; records=[]; labels=[]; alarms=[]; safety_hist=[]; restricted_steps=0
+    control_decisions={tid:supervisor.decide(1.0,False,False,False) for tid in rail.trains}
+    sequence={}; records=[]; labels=[]; alarms=[]; safety_hist=[]; restricted_train_updates=0; train_control_updates=0
     pending_meta: dict[int, tuple[int,str]]={}
     attack_start,attack_end=55,105
     for step in range(steps):
         now=step*dt
+        applied_control_state={}
+        applied_speed_cap={}
         for tid in ["T1","T2"]:
             train=rail.trains[tid]
             if train.completed: continue
@@ -89,8 +92,11 @@ def run_simulation(scenario: str="normal", steps: int=220, dt: float=1.0, seed: 
             if train.route_index == len(train.route)-1:
                 authority = 1
             desired=14.0 if tid=="T1" else 12.0
-            current_trust=trust.get(f"train:{tid}")
-            decision=supervisor.decide(current_trust, False, False, False)
+            decision=control_decisions[tid]
+            applied_control_state[tid]=decision.state
+            applied_speed_cap[tid]=decision.speed_cap_mps
+            train_control_updates += 1
+            if decision.state!="NORMAL": restricted_train_updates += 1
             speed=target_speed(train, authority, min(decision.speed_cap_mps, desired))
             if tid=="T2" and train.route_index==1 and rail.trains["T1"].route_index < 3:
                 speed=0.0
@@ -98,6 +104,10 @@ def run_simulation(scenario: str="normal", steps: int=220, dt: float=1.0, seed: 
             twin.predict(tid, train.route, speed, dt)
         rail.signals["S2"].aspect = "GREEN" if rail.track.blocks["J"].clear else "RED"
         safety=evaluate_safety(rail,interlocking); safety_hist.append(safety)
+        safety_conflict=sum(safety.values())>0
+        if safety_conflict:
+            for tid in rail.trains:
+                control_decisions[tid]=supervisor.decide(trust.get(f"train:{tid}"),False,True,False)
         sources=[]
         for tid,train in rail.trains.items():
             if train.completed: continue
@@ -133,15 +143,22 @@ def run_simulation(scenario: str="normal", steps: int=220, dt: float=1.0, seed: 
                 result=detector.evaluate_discrete(src,expected,delivered.payload,fresh)
             new_trust=trust.update(src,result.score)
             recovered=recovery.update(src,result.alarm)
-            safety_conflict=sum(safety.values())>0
             dec=supervisor.decide(new_trust,result.alarm,safety_conflict,recovered)
-            if dec.state!="NORMAL": restricted_steps += 1
+            if kind=="train":
+                tid=src.split(":",1)[1]
+                control_decisions[tid]=dec
+            elif result.alarm or safety_conflict:
+                # Discrete signaling/occupancy alarms conservatively constrain all
+                # active trains until clean train telemetry updates the decisions.
+                for tid in rail.trains:
+                    if dec.speed_cap_mps < control_decisions[tid].speed_cap_mps:
+                        control_decisions[tid]=dec
             labels.append(label); alarms.append(int(result.alarm))
             if kind=="train" and src=="train:T1":
-                records.append({"step":step,"time_s":now,"source":src,"alarm":result.alarm,"score":round(result.score,3),"trust":round(new_trust,3),"state":dec.state,"attack":label,"telemetry_age_s":round(max(0.0,now-delivered.timestamp),3)})
+                records.append({"step":step,"time_s":now,"source":src,"alarm":result.alarm,"score":round(result.score,3),"trust":round(new_trust,3),"state":dec.state,"attack":label,"telemetry_age_s":round(max(0.0,now-delivered.timestamp),3),"applied_control_state":applied_control_state.get("T1","COMPLETED"),"applied_speed_cap_mps":applied_speed_cap.get("T1",0.0),"next_control_state":control_decisions["T1"].state})
     cyber=classification_metrics(labels,alarms); ops=service_metrics(rail.trains,steps*dt); safe=safety_metrics(safety_hist)
-    restriction_fraction=restricted_steps/max(1,len(labels)); res_score=resilience_score(ops["completion_ratio"],sum(safe.values()),restriction_fraction)
-    metrics={**cyber,**ops,**safe,"restriction_fraction":restriction_fraction,"resilience_score":res_score}
+    restriction_fraction=restricted_train_updates/max(1,train_control_updates); res_score=resilience_score(ops["completion_ratio"],sum(safe.values()),restriction_fraction)
+    metrics={**cyber,**ops,**safe,"restriction_fraction":restriction_fraction,"train_control_updates":train_control_updates,"restricted_train_updates":restricted_train_updates,"resilience_score":res_score}
     if records:
         metrics["mean_t1_telemetry_age_s"]=sum(r["telemetry_age_s"] for r in records)/len(records)
     else:
