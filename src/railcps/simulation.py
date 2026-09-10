@@ -13,7 +13,7 @@ from railcps.cyber.telemetry import TelemetryPacket
 from railcps.cyber.network import Network
 from railcps.cyber.freshness import FreshnessChecker
 from railcps.cyber.attacks import AttackInjector
-from railcps.twin.digital_twin import RailwayDigitalTwin
+from railcps.twin.digital_twin import RailwayDigitalTwin, TwinTrainState
 from railcps.twin.uncertainty import TwinUncertainty
 from railcps.twin.residuals import train_residual
 from railcps.security.detector import HybridDetector
@@ -75,6 +75,8 @@ def run_simulation(scenario: str="normal", steps: int=220, dt: float=1.0, seed: 
     freshness=FreshnessChecker(); twin=RailwayDigitalTwin(); unc=TwinUncertainty(); detector=HybridDetector(); trust=TrustManager(); supervisor=ResilienceSupervisor(); recovery=RecoveryTracker()
     for t in rail.trains.values(): twin.initialize(t)
     control_decisions={tid:supervisor.decide(1.0,False,False,False) for tid in rail.trains}
+    twin_history: dict[str, dict[float, TwinTrainState]]={tid:{} for tid in rail.trains}
+    expected_history: dict[str, dict[float, dict]]={}
     sequence={}; records=[]; labels=[]; alarms=[]; safety_hist=[]; restricted_train_updates=0; train_control_updates=0
     pending_meta: dict[int, tuple[int,str]]={}
     attack_start,attack_end=55,105
@@ -101,7 +103,8 @@ def run_simulation(scenario: str="normal", steps: int=220, dt: float=1.0, seed: 
             if tid=="T2" and train.route_index==1 and rail.trains["T1"].route_index < 3:
                 speed=0.0
             rail.move_train(tid,speed,dt)
-            twin.predict(tid, train.route, speed, dt)
+            ts=twin.predict(tid, train.route, speed, dt)
+            twin_history[tid][now]=TwinTrainState(ts.block_id,ts.position_m,ts.speed_mps)
         rail.signals["S2"].aspect = "GREEN" if rail.track.blocks["J"].clear else "RED"
         safety=evaluate_safety(rail,interlocking); safety_hist.append(safety)
         safety_conflict=sum(safety.values())>0
@@ -118,13 +121,17 @@ def run_simulation(scenario: str="normal", steps: int=220, dt: float=1.0, seed: 
         sources.append(("switch:SW1", {"position":rail.switches["SW1"].position}, "switch"))
 
         for src,payload,kind in sources:
+            expected_history.setdefault(src,{})[now]=dict(payload)
             sequence[src]=sequence.get(src,0)+1
             packet=TelemetryPacket(src,sequence[src],now,payload)
             active=attack_start <= step < attack_end
             packet=injector.apply(packet,step,active)
             label=int(active and mode!="none" and (target is None or src==target))
             if not network.send(packet,now):
-                labels.append(0); alarms.append(0); continue
+                # A dropped attacked observation is still an attack opportunity
+                # that the detector failed to observe, so retain its ground-truth
+                # label instead of silently turning it into a true negative.
+                labels.append(label); alarms.append(0); continue
             pending_meta[id(packet)]=(label,kind)
 
         for delivered in network.receive(now):
@@ -132,14 +139,21 @@ def run_simulation(scenario: str="normal", steps: int=220, dt: float=1.0, seed: 
             src=delivered.source
             fresh=freshness.check(delivered)
             if kind=="train":
-                tid=src.split(":",1)[1]; ts=twin.states[tid]; res=train_residual(delivered.payload,ts,unc)
+                tid=src.split(":",1)[1]
+                # Compare delayed telemetry against the digital-twin state at the
+                # packet timestamp, not against the current state. Legitimate
+                # latency should not create artificial position/speed residuals.
+                ts=twin_history.get(tid,{}).get(delivered.timestamp,twin.states[tid])
+                res=train_residual(delivered.payload,ts,unc)
                 result=detector.evaluate_train(src,res,fresh)
             else:
-                if kind=="occupancy":
-                    bid=src.split(":",1)[1]; expected={"block_id":bid,"occupied":int(not rail.track.blocks[bid].clear)}
-                elif kind=="signal": expected={"aspect":rail.signals["S2"].aspect}
-                elif kind=="switch": expected={"position":rail.switches["SW1"].position}
-                else: continue
+                expected=expected_history.get(src,{}).get(delivered.timestamp)
+                if expected is None:
+                    if kind=="occupancy":
+                        bid=src.split(":",1)[1]; expected={"block_id":bid,"occupied":int(not rail.track.blocks[bid].clear)}
+                    elif kind=="signal": expected={"aspect":rail.signals["S2"].aspect}
+                    elif kind=="switch": expected={"position":rail.switches["SW1"].position}
+                    else: continue
                 result=detector.evaluate_discrete(src,expected,delivered.payload,fresh)
             new_trust=trust.update(src,result.score)
             recovered=recovery.update(src,result.alarm)
@@ -148,8 +162,6 @@ def run_simulation(scenario: str="normal", steps: int=220, dt: float=1.0, seed: 
                 tid=src.split(":",1)[1]
                 control_decisions[tid]=dec
             elif result.alarm or safety_conflict:
-                # Discrete signaling/occupancy alarms conservatively constrain all
-                # active trains until clean train telemetry updates the decisions.
                 for tid in rail.trains:
                     if dec.speed_cap_mps < control_decisions[tid].speed_cap_mps:
                         control_decisions[tid]=dec
