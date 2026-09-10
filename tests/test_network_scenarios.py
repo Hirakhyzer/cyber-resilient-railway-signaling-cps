@@ -19,8 +19,10 @@ def test_network_queue_applies_delay_before_delivery():
     assert net.receive(2.0) == [packet]
 
 
-def test_high_latency_scenario_has_nonzero_telemetry_age():
+def test_high_latency_uses_timestamp_aligned_reference_state():
     normal=run_simulation("normal")
     delayed=run_simulation("high_latency")
     assert normal.metrics["mean_t1_telemetry_age_s"] == 0.0
     assert delayed.metrics["mean_t1_telemetry_age_s"] >= 1.0
+    assert delayed.metrics["false_positive_rate"] == 0.0
+    assert delayed.metrics["completion_ratio"] == 1.0
